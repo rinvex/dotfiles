@@ -869,6 +869,11 @@ defaults write com.apple.TextEdit "TabWidth" '4'
 # Auto hide menu bar
 defaults write NSGlobalDomain _HIHideMenuBar -bool true
 
+# Disable Notes smart dashes as they’re annoying when typing code
+defaults write com.apple.Notes ShouldUseSmartQuotes -bool false
+defaults write com.apple.Notes ShouldUseSmartDashes -bool false
+defaults write com.apple.Notes ICTextStyleAutoListInsertionEnabled -bool false
+
 ###############################################################################
 # Kill affected applications                                                  #
 ###############################################################################
