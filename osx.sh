@@ -208,12 +208,12 @@ defaults -currentHost write NSGlobalDomain com.apple.mouse.tapBehavior -int 1
 #defaults write NSGlobalDomain com.apple.swipescrolldirection -bool false
 
 # Increase sound quality for Bluetooth headphones/headsets
-#defaults write com.apple.BluetoothAudioAgent "Apple Bitpool Max (editable)" 80 
-#defaults write com.apple.BluetoothAudioAgent "Apple Bitpool Min (editable)" 48 
-#defaults write com.apple.BluetoothAudioAgent "Apple Initial Bitpool (editable)" 40 
-#defaults write com.apple.BluetoothAudioAgent "Apple Initial Bitpool Min (editable)" 40 
-#defaults write com.apple.BluetoothAudioAgent "Negotiated Bitpool" 58 
-#defaults write com.apple.BluetoothAudioAgent "Negotiated Bitpool Max" 58 
+#defaults write com.apple.BluetoothAudioAgent "Apple Bitpool Max (editable)" 80
+#defaults write com.apple.BluetoothAudioAgent "Apple Bitpool Min (editable)" 48
+#defaults write com.apple.BluetoothAudioAgent "Apple Initial Bitpool (editable)" 40
+#defaults write com.apple.BluetoothAudioAgent "Apple Initial Bitpool Min (editable)" 40
+#defaults write com.apple.BluetoothAudioAgent "Negotiated Bitpool" 58
+#defaults write com.apple.BluetoothAudioAgent "Negotiated Bitpool Max" 58
 #defaults write com.apple.BluetoothAudioAgent "Negotiated Bitpool Min" 48
 
 # Enable full keyboard access for all controls
