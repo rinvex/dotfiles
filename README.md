@@ -10,4 +10,5 @@ These dotfiles prepared for internal use only, without much attention for genera
 2. Execute osx.sh file in your terminal to modify system preferences.
 3. Install oh-my-zsh: `sh -c "$(curl -fsSL https://raw.githubusercontent.com/robbyrussell/oh-my-zsh/master/tools/install.sh)"`
 4. Copy oh-my-zsh theme: `mkdir -p ~/.oh-my-zsh/custom/themes && curl -fsSL https://raw.githubusercontent.com/rinvex/dotfiles/master/spaceship.zsh-theme -o ~/.oh-my-zsh/custom/themes/spaceship.zsh-theme`
-5. Done!
+5. Copy `Spectacle-Shortcuts.json` to `~/Library/Application Support/Spectacle/Shortcuts.json`.
+6. Done!
