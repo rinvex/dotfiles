@@ -185,9 +185,6 @@ alias mem='top -o rsize'
 # Force awaking for up to xxx seconds
 alias upfor='caffeinate -t '
 
-# Homeboy
-alias homeboy='php ~/homeboy/Homeboy'
-
 # SSH Homestead Access
 alias vmh='ssh vagrant@192.168.10.10 -p 22'
 
