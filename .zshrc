@@ -59,8 +59,7 @@ plugins=(git git-flow history laravel5)
 
 # User configuration
 
-export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/home/vagrant/.composer/vendor/bin:/opt/X11/bin:/usr/local/MacGPG2/bin:/vagrant/scripts:/home/vagrant/.local/bin:$PATH"
-# export MANPATH="/usr/local/man:$MANPATH"
+export PATH=$PATH:$HOME/.composer/vendor/bin
 
 source $ZSH/oh-my-zsh.sh
 
