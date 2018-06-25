@@ -55,7 +55,7 @@ COMPLETION_WAITING_DOTS="true"
 # Custom plugins may be added to ~/.oh-my-zsh/custom/plugins/
 # Example format: plugins=(rails git textmate ruby lighthouse)
 # Add wisely, as too many plugins slow down shell startup.
-plugins=(git git-flow history laravel5)
+plugins=(git composer phing symfony symfony2 docker docker-compose laravel laravel5)
 
 # User configuration
 
@@ -88,3 +88,5 @@ promptinit
 
 # The alias that takes me here to editing these very aliases
 alias profile='open -e ~/.zshrc'
+export PATH="$HOME/.rbenv/bin:$PATH"
+eval "$(rbenv init -)"
