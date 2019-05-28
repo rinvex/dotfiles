@@ -185,12 +185,37 @@ alias mem='top -o rsize'
 # Force awaking for up to xxx seconds
 alias upfor='caffeinate -t '
 
-# SSH Homestead Access
-alias vmh='ssh vagrant@192.168.10.10 -p 22'
+# Access docker container
+in() {
+    docker exec -it punnet_"$1"_1 /bin/bash
+}
 
-# SSH Homestead Up
-alias uph='cd ~/Homestead; vagrant up; vmh;'
+# Confirm prompt
+confirm() {
+    # call with a prompt string or use a default
+    read "?${1:-Are you sure? [y/N]} " response
+    case "$response" in
+        [yY][eE][sS]|[yY]) 
+            true
+            ;;
+        *)
+            false
+            ;;
+    esac
+}
 
-# SSH Homestead Up
-alias downh='cd ~/Homestead; vagrant halt;'
+# Destroy docker containers
+destroy() {
+    set +e
+    confirm "This will destroy all docker containers! Are you sure?" && \
+    docker-compose down && \
+    docker rm $(docker ps -aq) && \
+    docker rmi $(docker image ls) && \
+    docker volume rm $(docker volume ls)
+}
 
+# Deploy docker containers
+deploy() {
+    confirm "This will re-deploy all docker containers! Are you sure?" && \
+    docker-compose up -d redis mysql portainer workspace php-fpm nginx
+}
