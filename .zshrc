@@ -59,7 +59,7 @@ plugins=(git composer phing symfony symfony2 docker docker-compose laravel larav
 
 # User configuration
 
-export PATH=$PATH:$HOME/.composer/vendor/bin
+# export PATH=$PATH:$HOME/.composer/vendor/bin
 
 source $ZSH/oh-my-zsh.sh
 
@@ -88,5 +88,5 @@ promptinit
 
 # The alias that takes me here to editing these very aliases
 alias profile='open -e ~/.zshrc'
-export PATH="$HOME/.rbenv/bin:$PATH"
-eval "$(rbenv init -)"
+# export PATH="$HOME/.rbenv/bin:$PATH"
+# eval "$(rbenv init -)"
