@@ -185,6 +185,12 @@ alias mem='top -o rsize'
 # Force awaking for up to xxx seconds
 alias upfor='caffeinate -t '
 
+# Start docker containers
+alias up='cd ~/Dropbox/Code/punnet && docker-compose start'
+
+# Stop docker containers
+alias down='cd ~/Dropbox/Code/punnet && docker-compose stop'
+
 # Access docker container
 in() {
     docker exec -it punnet_"$1"_1 /bin/bash
@@ -217,5 +223,7 @@ destroy() {
 # Deploy docker containers
 deploy() {
     confirm "This will re-deploy all docker containers! Are you sure?" && \
+    cd ~/Dropbox/Code/punnet && \
     docker-compose up -d redis mysql portainer workspace php-fpm nginx
 }
+
