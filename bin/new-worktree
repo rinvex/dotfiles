@@ -212,6 +212,16 @@ build_assets() {
   fi
 }
 
+# clone_storage PROJECT_APP_DIR APP_DIR — uploads, slides, generated files: an instant
+# copy-on-write clone so the worktree sees the same files without sharing them
+clone_storage() {
+  local src="$1/storage/app" dst="$2/storage/app"
+  [ -d "$src" ] || return 0
+  mkdir -p "$dst"
+  if cp -c -R "$src/." "$dst/" 2>/dev/null; then ok "storage/app cloned (copy-on-write)"
+  else warn "storage/app could not be cloned; worktree starts with empty storage"; fi
+}
+
 # ── new ───────────────────────────────────────────────────
 cmd_new() {
   local args=() a
@@ -289,6 +299,7 @@ cmd_new() {
 
   # 6. runtime + serve
   if [ "$stack" = laravel ]; then
+    clone_storage "$project_app_dir" "$app_dir"
     php artisan storage:link 2>/dev/null || true
     herd link "$worktree_host"
     herd secure "$worktree_host" 2>/dev/null || true
