@@ -8,10 +8,16 @@
 #
 #   launch_cmd (optional): what to exec inside the worktree when done, e.g. "claude".
 #   Default: a login shell.
+#
+#   Options (anywhere on the line):
+#     --fresh     Laravel: migrate + seed an empty database instead of copying the project's data
+#     --no-open   do not open the browser when done
 set -euo pipefail
 
 WORKTREES_ROOT="${WORKTREES_ROOT:-$HOME/Worktrees}"
 TLD="${HERD_TLD:-test}"
+OPT_FRESH=0
+OPT_OPEN=1
 
 # ── helpers ───────────────────────────────────────────────
 say()  { printf '\033[1;34m▸\033[0m %s\n' "$*"; }
@@ -51,8 +57,115 @@ detect_stack() {
   fi
 }
 
+# ── .env helpers ──────────────────────────────────────────
+env_get() { sed -n -E "s/^$2=[\"']?([^\"']*)[\"']?\$/\1/p" "$1" | head -1; }
+# env_set FILE KEY VALUE — replace in place, or append if the key is absent
+env_set() {
+  if grep -q "^$2=" "$1"; then sed -i '' -E "s|^$2=.*|$2=$3|" "$1"; else printf '%s=%s\n' "$2" "$3" >> "$1"; fi
+}
+# env_set_if_present FILE KEY VALUE — only rewrite keys the project actually uses
+env_set_if_present() { grep -q "^$2=" "$1" && sed -i '' -E "s|^$2=.*|$2=$3|" "$1" || true; }
+
+# ── laravel ───────────────────────────────────────────────
+# laravel_env PROJECT_APP_DIR APP_DIR HOST DBNAME
+laravel_env() {
+  local src="$1/.env" dst="$2/.env" host="$3" dbname="$4"
+  [ -f "$src" ] || { warn "no .env in project; copying .env.example"; src="$1/.env.example"; }
+  [ -f "$src" ] || die "no .env or .env.example to start from"
+  cp "$src" "$dst"
+  env_set "$dst" APP_URL "https://$host.$TLD"
+  env_set_if_present "$dst" APP_DOMAIN "$host.$TLD"
+  env_set_if_present "$dst" ASSET_URL "https://$host.$TLD"
+  env_set_if_present "$dst" VITE_APP_URL "https://$host.$TLD"
+  env_set_if_present "$dst" SANCTUM_STATEFUL_DOMAINS "$host.$TLD"
+  # namespace every shared stateful backend
+  env_set "$dst" CACHE_PREFIX   "$dbname"
+  env_set "$dst" REDIS_PREFIX   "${dbname}:"
+  env_set "$dst" SESSION_COOKIE "${dbname}_session"
+  # pin the cookie to this exact host so sibling *.PROJECT.test worktrees never share a session
+  env_set "$dst" SESSION_DOMAIN "$host.$TLD"
+  [ -z "$(env_get "$dst" APP_KEY)" ] && php artisan key:generate --force --quiet
+  ok ".env namespaced"
+}
+
+# laravel_database PROJECT_APP_DIR APP_DIR DBNAME
+# Gives the worktree its own database holding a copy of the project's data
+# (or an empty migrated + seeded one with --fresh).
+laravel_database() {
+  local src_dir="$1" dir="$2" dbname="$3" env="$2/.env" driver
+  driver="$(env_get "$env" DB_CONNECTION)"; [ -n "$driver" ] || driver="$(php -r 'echo config("database.default");' 2>/dev/null || echo sqlite)"
+  case "$driver" in
+    sqlite)
+      local src_db db
+      db="$(env_get "$env" DB_DATABASE)"
+      if [ -z "$db" ]; then
+        db="$dir/database/database.sqlite"; src_db="$src_dir/database/database.sqlite"
+      elif [ "${db#/}" != "$db" ]; then                 # absolute path
+        case "$db" in "$src_dir"/*) src_db="$db"; db="$dir${db#"$src_dir"}"; env_set "$env" DB_DATABASE "$db" ;;
+                       *) die "DB_DATABASE points outside the project ($db); refusing to share a sqlite file between worktrees" ;; esac
+      else                                              # relative to the app dir
+        src_db="$src_dir/$db"; db="$dir/$db"
+      fi
+      mkdir -p "$(dirname "$db")"
+      if [ "$OPT_FRESH" = 1 ] || [ ! -f "$src_db" ]; then
+        : > "$db"; php artisan migrate --force --seed --no-interaction
+        ok "sqlite database created fresh: ${db#"$dir"/}"
+      else
+        cp -c "$src_db" "$db" 2>/dev/null || cp "$src_db" "$db"
+        php artisan migrate --force --no-interaction
+        ok "sqlite database cloned from project: ${db#"$dir"/}"
+      fi
+      ;;
+    mysql|mariadb)
+      local h P u pw src_db
+      h="$(env_get "$env" DB_HOST)"; P="$(env_get "$env" DB_PORT)"; u="$(env_get "$env" DB_USERNAME)"; pw="$(env_get "$env" DB_PASSWORD)"
+      src_db="$(env_get "$src_dir/.env" DB_DATABASE)"
+      local mysql_args=(-h"${h:-127.0.0.1}" -P"${P:-3306}" -u"${u:-root}"); [ -n "$pw" ] && mysql_args+=(-p"$pw")
+      env_set "$env" DB_DATABASE "$dbname"
+      mysql "${mysql_args[@]}" -e "CREATE DATABASE IF NOT EXISTS \`$dbname\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+      if [ "$OPT_FRESH" = 1 ] || [ -z "$src_db" ] || ! mysql "${mysql_args[@]}" -e "USE \`$src_db\`" 2>/dev/null; then
+        php artisan migrate --force --seed --no-interaction
+        ok "$driver database created fresh: $dbname"
+      else
+        mysqldump "${mysql_args[@]}" --single-transaction --quick --routines --triggers --set-gtid-purged=OFF "$src_db" 2>/dev/null \
+          | mysql "${mysql_args[@]}" "$dbname"
+        php artisan migrate --force --no-interaction
+        ok "$driver database cloned from $src_db: $dbname"
+      fi
+      ;;
+    pgsql)
+      local h P u pw src_db
+      h="$(env_get "$env" DB_HOST)"; P="$(env_get "$env" DB_PORT)"; u="$(env_get "$env" DB_USERNAME)"; pw="$(env_get "$env" DB_PASSWORD)"
+      src_db="$(env_get "$src_dir/.env" DB_DATABASE)"
+      env_set "$env" DB_DATABASE "$dbname"
+      export PGPASSWORD="$pw"
+      if [ "$OPT_FRESH" = 1 ] || [ -z "$src_db" ]; then
+        psql -h"${h:-127.0.0.1}" -p"${P:-5432}" -U"${u:-postgres}" -d postgres -c "CREATE DATABASE \"$dbname\""
+        php artisan migrate --force --seed --no-interaction
+        ok "pgsql database created fresh: $dbname"
+      else
+        # TEMPLATE copy is instant but needs no open connections on the source
+        psql -h"${h:-127.0.0.1}" -p"${P:-5432}" -U"${u:-postgres}" -d postgres -c "CREATE DATABASE \"$dbname\" TEMPLATE \"$src_db\"" \
+          || die "could not clone $src_db (close open connections to it, or use --fresh)"
+        php artisan migrate --force --no-interaction
+        ok "pgsql database cloned from $src_db: $dbname"
+      fi
+      unset PGPASSWORD
+      ;;
+    *) warn "unknown DB_CONNECTION '$driver'; database left untouched" ;;
+  esac
+}
+
 # ── new ───────────────────────────────────────────────────
 cmd_new() {
+  local args=() a
+  for a in "$@"; do case "$a" in
+    --fresh)   OPT_FRESH=1 ;;
+    --no-open) OPT_OPEN=0 ;;
+    --*)       die "unknown option: $a" ;;
+    *)         args+=("$a") ;;
+  esac; done
+  set -- "${args[@]+"${args[@]}"}"
   [ $# -ge 3 ] || usage
   local project_repo base_branch new_feature launch_cmd
   project_repo="$(cd "$1" 2>/dev/null && pwd -P)" || die "project path not found: $1"
@@ -101,20 +214,10 @@ cmd_new() {
   # 2. env: copy blueprint, then NAMESPACE every stateful backend (this is what isolates it)
   local project_app_dir="$project_repo${app_rel:+/$app_rel}" worktree_database
   worktree_database="wt_$(printf '%s' "${project_name}_${worktree_name}" | tr '.-' '__')"
-  if [ -f "$project_app_dir/.env" ]; then
-    cp "$project_app_dir/.env" .env
-    sed -i '' -E "\
-      s|^APP_URL=.*|APP_URL=https://$worktree_host.$TLD|; \
-      s|^DB_DATABASE=.*|DB_DATABASE=$worktree_database|; \
-      s|^CACHE_PREFIX=.*|CACHE_PREFIX=$worktree_database|; \
-      s|^REDIS_PREFIX=.*|REDIS_PREFIX=${worktree_database}:|; \
-      s|^SESSION_COOKIE=.*|SESSION_COOKIE=${worktree_database}_session|; \
-      s|^SESSION_DOMAIN=.*|SESSION_DOMAIN=$worktree_host.$TLD|" .env
-    grep -q '^CACHE_PREFIX='    .env || echo "CACHE_PREFIX=$worktree_database"             >> .env
-    grep -q '^REDIS_PREFIX='    .env || echo "REDIS_PREFIX=${worktree_database}:"          >> .env
-    grep -q '^SESSION_COOKIE='  .env || echo "SESSION_COOKIE=${worktree_database}_session" >> .env
-    grep -q '^SESSION_DOMAIN='  .env || echo "SESSION_DOMAIN=$worktree_host.$TLD"          >> .env
-    ok ".env namespaced"
+  if [ "$stack" = laravel ]; then
+    laravel_env "$project_app_dir" "$app_dir" "$worktree_host" "$worktree_database"
+  elif [ -f "$project_app_dir/.env" ]; then
+    cp "$project_app_dir/.env" .env; ok ".env copied"
   fi
 
   # 3. deps: instant APFS clone → reconcile against the branch's lockfile
@@ -126,11 +229,9 @@ cmd_new() {
   fi
   ok "dependencies ready"
 
-  # 4. isolated database — fresh schema + seed data
+  # 4. isolated database
   if [ "$stack" = laravel ]; then
-    mysql -uroot -e "CREATE DATABASE IF NOT EXISTS \`$worktree_database\`"
-    php artisan migrate --force --seed
-    ok "database $worktree_database"
+    laravel_database "$project_app_dir" "$app_dir" "$worktree_database"
   fi
 
   # 5. runtime + serve
@@ -139,7 +240,7 @@ cmd_new() {
     herd link "$worktree_host"
     herd secure "$worktree_host" 2>/dev/null || true
     ok "$worktree_branch  →  https://$worktree_host.$TLD  (db: $worktree_database)"
-    open "https://$worktree_host.$TLD" 2>/dev/null || true
+    [ "$OPT_OPEN" = 1 ] && { open "https://$worktree_host.$TLD" 2>/dev/null || true; }
   fi
 
   # hand off inside the worktree: run launch_cmd if given (e.g. claude), else a login shell
@@ -152,6 +253,8 @@ cmd_new() {
 }
 
 # ── dispatch ──────────────────────────────────────────────
+# `NEW_WORKTREE_LIB=1 source new-worktree` loads the functions without running anything (tests)
+[ "${NEW_WORKTREE_LIB:-}" = 1 ] && return 0 2>/dev/null
 case "${1:-}" in
   -h|--help|help|"") usage 0 ;;
   new) shift; cmd_new "$@" ;;
