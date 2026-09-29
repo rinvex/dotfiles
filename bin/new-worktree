@@ -156,6 +156,62 @@ laravel_database() {
   esac
 }
 
+# ── dependencies ──────────────────────────────────────────
+# node_pm APP_DIR — package manager implied by the lockfile
+node_pm() {
+  if   [ -f "$1/pnpm-lock.yaml" ]; then echo pnpm
+  elif [ -f "$1/yarn.lock" ];      then echo yarn
+  elif [ -f "$1/bun.lock" ] || [ -f "$1/bun.lockb" ]; then echo bun
+  else echo npm; fi
+}
+
+# install_deps PROJECT_APP_DIR APP_DIR
+# Instant APFS clone of the project's vendor/ and node_modules/, then a
+# lockfile-respecting install so the tree matches THIS branch.
+install_deps() {
+  local src="$1" dir="$2"
+  if [ -f "$dir/composer.json" ]; then
+    [ -d "$src/vendor" ] && [ ! -d "$dir/vendor" ] && { cp -c -R "$src/vendor" "$dir/vendor" 2>/dev/null || true; }
+    (cd "$dir" && composer install --no-interaction --quiet) || die "composer install failed"
+    ok "composer dependencies ready"
+  fi
+  if [ -f "$dir/package.json" ]; then
+    local pm; pm="$(node_pm "$dir")"
+    command -v "$pm" >/dev/null || die "$pm not found (the lockfile in this project implies it)"
+    [ -d "$src/node_modules" ] && [ ! -d "$dir/node_modules" ] && { cp -c -R "$src/node_modules" "$dir/node_modules" 2>/dev/null || true; }
+    ( cd "$dir" && case "$pm" in
+        npm)  npm install --no-audit --no-fund --prefer-offline --silent ;;
+        pnpm) pnpm install --frozen-lockfile --silent ;;
+        yarn) yarn install --frozen-lockfile --silent ;;
+        bun)  bun install --frozen-lockfile ;;
+      esac ) || die "$pm install failed"
+    # npm rewrites the lock's root "name" from the folder name when package.json has none — drop that noise
+    local lock="$dir/package-lock.json"
+    if [ -f "$lock" ] && ! git -C "$dir" diff --quiet -- package-lock.json 2>/dev/null; then
+      if [ -z "$(git -C "$dir" diff -- package-lock.json | grep -E '^[-+] ' | grep -v '"name":')" ]; then
+        git -C "$dir" checkout -- package-lock.json
+      else
+        warn "package-lock.json changed during install: the project's lockfile is out of sync with package.json"
+      fi
+    fi
+    ok "$pm dependencies ready"
+  fi
+}
+
+# build_assets APP_DIR STACK — Laravel/Vite sites need a build to serve without a dev server
+build_assets() {
+  local dir="$1" stack="$2"
+  [ "$stack" = laravel ] && [ -f "$dir/package.json" ] || return 0
+  grep -q '"build"' "$dir/package.json" || return 0
+  local pm; pm="$(node_pm "$dir")"
+  local log; log="$(mktemp -t new-worktree-build)"
+  if (cd "$dir" && case "$pm" in npm) npm run build --silent ;; *) "$pm" run build ;; esac >"$log" 2>&1); then
+    rm -f "$log"; ok "assets built"
+  else
+    cat "$log" >&2; rm -f "$log"; die "asset build failed"
+  fi
+}
+
 # ── new ───────────────────────────────────────────────────
 cmd_new() {
   local args=() a
@@ -221,20 +277,17 @@ cmd_new() {
   fi
 
   # 3. deps: instant APFS clone → reconcile against the branch's lockfile
-  [ -d "$project_app_dir/vendor" ] && { cp -c -R "$project_app_dir/vendor" ./vendor 2>/dev/null || true; }
-  [ -f composer.json ] && composer install --no-interaction --quiet
-  if [ -f package.json ]; then
-    [ -d "$project_app_dir/node_modules" ] && { cp -c -R "$project_app_dir/node_modules" ./node_modules 2>/dev/null || true; }
-    npm install --silent
-  fi
-  ok "dependencies ready"
+  install_deps "$project_app_dir" "$app_dir"
 
   # 4. isolated database
   if [ "$stack" = laravel ]; then
     laravel_database "$project_app_dir" "$app_dir" "$worktree_database"
   fi
 
-  # 5. runtime + serve
+  # 5. assets
+  build_assets "$app_dir" "$stack"
+
+  # 6. runtime + serve
   if [ "$stack" = laravel ]; then
     php artisan storage:link 2>/dev/null || true
     herd link "$worktree_host"
