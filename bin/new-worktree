@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# new-worktree <project_repo> <base_branch> <new_feature> [launch_cmd]
+#   Fork a fully-isolated worktree off a blueprint project and serve it on Herd.
+#   launch_cmd (optional): what to exec in the worktree when done. Default: a login shell.
+set -euo pipefail
+
+# ── inputs ────────────────────────────────────────────────
+project_repo="$1"     # BLUEPRINT repo path        ~/Projects/rinvex/awqaf
+base_branch="$2"      # branch in blueprint to fork off    develop
+new_feature="$3"      # human feature name         "Login Flow"
+launch_cmd="${4:-}"   # optional: e.g. "claude"; empty = drop into a shell
+
+# ── derived from the blueprint (project side) ─────────────
+project_category="$(basename "$(dirname "$project_repo")")"              # rinvex
+project_name="$(basename "$project_repo")"                               # awqaf
+
+# ── derived for the worktree side ─────────────────────────
+worktree_name="$(printf '%s' "$new_feature" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')"
+worktree_branch="feature/$worktree_name"
+worktree_path="$HOME/Worktrees/$project_category/$project_name/$worktree_name"
+worktree_host="$worktree_name.$project_name"
+worktree_database="wt_$(printf '%s' "${project_name}_${worktree_name}" | tr '.-' '__')"
+
+# 1. worktree: new branch off the blueprint's base branch
+git -C "$project_repo" worktree add "$worktree_path" -b "$worktree_branch" "$base_branch"
+cd "$worktree_path"
+
+# 2. env: copy blueprint, then NAMESPACE every stateful backend (this is what isolates it)
+cp "$project_repo/.env" .env
+sed -i '' -E "\
+  s|^APP_URL=.*|APP_URL=https://$worktree_host.test|; \
+  s|^DB_DATABASE=.*|DB_DATABASE=$worktree_database|; \
+  s|^CACHE_PREFIX=.*|CACHE_PREFIX=$worktree_database|; \
+  s|^REDIS_PREFIX=.*|REDIS_PREFIX=${worktree_database}:|; \
+  s|^SESSION_COOKIE=.*|SESSION_COOKIE=${worktree_database}_session|; \
+  s|^SESSION_DOMAIN=.*|SESSION_DOMAIN=$worktree_host.test|" .env
+grep -q '^CACHE_PREFIX='   .env || echo "CACHE_PREFIX=$worktree_database"             >> .env
+grep -q '^REDIS_PREFIX='   .env || echo "REDIS_PREFIX=${worktree_database}:"          >> .env
+grep -q '^SESSION_COOKIE=' .env || echo "SESSION_COOKIE=${worktree_database}_session" >> .env
+# pin the cookie to this exact host so sibling *.PROJECT.test worktrees never share a session
+grep -q '^SESSION_DOMAIN='  .env || echo "SESSION_DOMAIN=$worktree_host.test"          >> .env
+
+# 3. deps: instant APFS clone → reconcile against the branch's lockfile
+cp -c -R "$project_repo/vendor" ./vendor 2>/dev/null || true
+composer install --no-interaction --quiet
+if [ -f package.json ]; then
+  cp -c -R "$project_repo/node_modules" ./node_modules 2>/dev/null || true
+  npm install --silent
+fi
+
+# 4. isolated database — fresh schema + seed data
+mysql -uroot -e "CREATE DATABASE IF NOT EXISTS \`$worktree_database\`"
+php artisan migrate --force --seed
+
+# 5. runtime + serve
+php artisan storage:link 2>/dev/null || true
+herd link "$worktree_host"
+herd secure "$worktree_host" 2>/dev/null || true
+
+echo "✅  $worktree_branch  →  https://$worktree_host.test  (db: $worktree_database)"
+open "https://$worktree_host.test" 2>/dev/null || true
+
+# hand off inside the worktree: run launch_cmd if given (e.g. claude), else a login shell
+cd "$worktree_path"
+if [ -n "$launch_cmd" ]; then
+  exec $launch_cmd
+else
+  exec "$SHELL" -l
+fi
