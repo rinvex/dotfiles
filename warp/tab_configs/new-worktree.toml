@@ -1,0 +1,21 @@
+name = "New worktree"
+title = "{{feature}}"
+color = "green"
+
+[[panes]]
+id = "work"
+type = "terminal"
+directory = "~"
+commands = ["new-worktree {{repo}} {{branch}} {{feature}}"]
+
+[params.repo]
+type = "repo"
+description = "Project to branch from"
+
+[params.branch]
+type = "branch"
+description = "Base branch to fork off"
+
+[params.feature]
+type = "text"
+description = "Feature name"
