@@ -1,69 +1,161 @@
 #!/usr/bin/env bash
-# new-worktree <project_repo> <base_branch> <new_feature> [launch_cmd]
-#   Fork a fully-isolated worktree off a blueprint project and serve it on Herd.
-#   launch_cmd (optional): what to exec in the worktree when done. Default: a login shell.
+# new-worktree — fork a fully isolated, Herd-served worktree off a project.
+#
+#   new-worktree [new] <project_repo> <base_branch> <feature_name> [launch_cmd]
+#   new-worktree rm <worktree_path|name> [--force]
+#   new-worktree ls
+#   new-worktree inspect <path>          (show detected app dir and stack)
+#
+#   launch_cmd (optional): what to exec inside the worktree when done, e.g. "claude".
+#   Default: a login shell.
 set -euo pipefail
 
-# ── inputs ────────────────────────────────────────────────
-project_repo="$1"     # BLUEPRINT repo path        ~/Projects/rinvex/awqaf
-base_branch="$2"      # branch in blueprint to fork off    develop
-new_feature="$3"      # human feature name         "Login Flow"
-launch_cmd="${4:-}"   # optional: e.g. "claude"; empty = drop into a shell
+WORKTREES_ROOT="${WORKTREES_ROOT:-$HOME/Worktrees}"
+TLD="${HERD_TLD:-test}"
 
-# ── derived from the blueprint (project side) ─────────────
-project_category="$(basename "$(dirname "$project_repo")")"              # rinvex
-project_name="$(basename "$project_repo")"                               # awqaf
+# ── helpers ───────────────────────────────────────────────
+say()  { printf '\033[1;34m▸\033[0m %s\n' "$*"; }
+ok()   { printf '\033[1;32m✔\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m!\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[1;31m✖\033[0m %s\n' "$*" >&2; exit 1; }
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; exit "${1:-1}"; }
 
-# ── derived for the worktree side ─────────────────────────
-worktree_name="$(printf '%s' "$new_feature" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')"
-worktree_branch="feature/$worktree_name"
-worktree_path="$HOME/Worktrees/$project_category/$project_name/$worktree_name"
-worktree_host="$worktree_name.$project_name"
-worktree_database="wt_$(printf '%s' "${project_name}_${worktree_name}" | tr '.-' '__')"
+slugify() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//'; }
 
-# 1. worktree: new branch off the blueprint's base branch
-git -C "$project_repo" worktree add "$worktree_path" -b "$worktree_branch" "$base_branch"
-cd "$worktree_path"
+# ── project inspection ────────────────────────────────────
+# app_dir: where the application actually lives inside a checkout.
+# Handles repos whose app sits in a subfolder (site/, app/, web/ …).
+# Only git-TRACKED markers count: an ignored subfolder (e.g. a nested repo)
+# will not exist inside a fresh worktree.
+tracked() { git -C "$1" ls-files --error-unmatch "$2" >/dev/null 2>&1; }
+find_app_dir() {
+  local root="$1" rel f
+  for rel in "" site app web src; do
+    for f in artisan package.json composer.json; do
+      tracked "$root" "${rel:+$rel/}$f" && { printf '%s' "$root${rel:+/$rel}"; return; }
+    done
+  done
+  # single tracked subfolder holding the app
+  local candidates
+  candidates=$(git -C "$root" ls-files 2>/dev/null | grep -E '^[^/]+/(artisan|package\.json)$' | sed 's#/[^/]*$##' | sort -u)
+  if [ "$(printf '%s\n' "$candidates" | grep -c .)" -eq 1 ]; then printf '%s' "$root/$candidates"; return; fi
+  printf '%s' "$root"
+}
 
-# 2. env: copy blueprint, then NAMESPACE every stateful backend (this is what isolates it)
-cp "$project_repo/.env" .env
-sed -i '' -E "\
-  s|^APP_URL=.*|APP_URL=https://$worktree_host.test|; \
-  s|^DB_DATABASE=.*|DB_DATABASE=$worktree_database|; \
-  s|^CACHE_PREFIX=.*|CACHE_PREFIX=$worktree_database|; \
-  s|^REDIS_PREFIX=.*|REDIS_PREFIX=${worktree_database}:|; \
-  s|^SESSION_COOKIE=.*|SESSION_COOKIE=${worktree_database}_session|; \
-  s|^SESSION_DOMAIN=.*|SESSION_DOMAIN=$worktree_host.test|" .env
-grep -q '^CACHE_PREFIX='   .env || echo "CACHE_PREFIX=$worktree_database"             >> .env
-grep -q '^REDIS_PREFIX='   .env || echo "REDIS_PREFIX=${worktree_database}:"          >> .env
-grep -q '^SESSION_COOKIE=' .env || echo "SESSION_COOKIE=${worktree_database}_session" >> .env
-# pin the cookie to this exact host so sibling *.PROJECT.test worktrees never share a session
-grep -q '^SESSION_DOMAIN='  .env || echo "SESSION_DOMAIN=$worktree_host.test"          >> .env
+# stack: laravel | node | static
+detect_stack() {
+  local d="$1"
+  if   [ -f "$d/artisan" ];        then echo laravel
+  elif [ -f "$d/package.json" ];   then echo node
+  else                                  echo static
+  fi
+}
 
-# 3. deps: instant APFS clone → reconcile against the branch's lockfile
-cp -c -R "$project_repo/vendor" ./vendor 2>/dev/null || true
-composer install --no-interaction --quiet
-if [ -f package.json ]; then
-  cp -c -R "$project_repo/node_modules" ./node_modules 2>/dev/null || true
-  npm install --silent
-fi
+# ── new ───────────────────────────────────────────────────
+cmd_new() {
+  [ $# -ge 3 ] || usage
+  local project_repo base_branch new_feature launch_cmd
+  project_repo="$(cd "$1" 2>/dev/null && pwd -P)" || die "project path not found: $1"
+  base_branch="$2"
+  new_feature="$3"
+  launch_cmd="${4:-}"
 
-# 4. isolated database — fresh schema + seed data
-mysql -uroot -e "CREATE DATABASE IF NOT EXISTS \`$worktree_database\`"
-php artisan migrate --force --seed
+  command -v git  >/dev/null || die "git not found"
+  git -C "$project_repo" rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not a git repository: $project_repo"
+  git -C "$project_repo" rev-parse --verify --quiet "refs/heads/$base_branch" >/dev/null \
+    || git -C "$project_repo" rev-parse --verify --quiet "refs/remotes/origin/$base_branch" >/dev/null \
+    || die "base branch not found: $base_branch"
 
-# 5. runtime + serve
-php artisan storage:link 2>/dev/null || true
-herd link "$worktree_host"
-herd secure "$worktree_host" 2>/dev/null || true
+  # derived from the blueprint (project side)
+  local project_category project_name
+  project_category="$(basename "$(dirname "$project_repo")")"   # rinvex
+  project_name="$(basename "$project_repo")"                    # awqaf
 
-echo "✅  $worktree_branch  →  https://$worktree_host.test  (db: $worktree_database)"
-open "https://$worktree_host.test" 2>/dev/null || true
+  # derived for the worktree side
+  local worktree_name worktree_branch worktree_path worktree_host
+  worktree_name="$(slugify "$new_feature")"
+  [ -n "$worktree_name" ] || die "feature name produced an empty slug: '$new_feature'"
+  worktree_branch="feature/$worktree_name"
+  worktree_path="$WORKTREES_ROOT/$project_category/$project_name/$worktree_name"
+  worktree_host="$worktree_name.$project_name"
 
-# hand off inside the worktree: run launch_cmd if given (e.g. claude), else a login shell
-cd "$worktree_path"
-if [ -n "$launch_cmd" ]; then
-  exec $launch_cmd
-else
-  exec "$SHELL" -l
-fi
+  [ -e "$worktree_path" ] && die "worktree path already exists: $worktree_path"
+  git -C "$project_repo" rev-parse --verify --quiet "refs/heads/$worktree_branch" >/dev/null \
+    && die "branch already exists: $worktree_branch (use another feature name, or delete it first)"
+
+  local app_rel app_dir stack
+  app_rel="$(find_app_dir "$project_repo")"; app_rel="${app_rel#"$project_repo"}"; app_rel="${app_rel#/}"
+  app_dir="$worktree_path${app_rel:+/$app_rel}"
+  stack="$(detect_stack "$project_repo${app_rel:+/$app_rel}")"
+
+  say "project  $project_repo  ($stack${app_rel:+, app in $app_rel/})"
+  say "worktree $worktree_path  branch $worktree_branch  off $base_branch"
+
+  # 1. worktree: new branch off the blueprint's base branch
+  mkdir -p "$(dirname "$worktree_path")"
+  git -C "$project_repo" worktree add "$worktree_path" -b "$worktree_branch" "$base_branch"
+  ok "worktree created"
+
+  cd "$app_dir"
+
+  # 2. env: copy blueprint, then NAMESPACE every stateful backend (this is what isolates it)
+  local project_app_dir="$project_repo${app_rel:+/$app_rel}" worktree_database
+  worktree_database="wt_$(printf '%s' "${project_name}_${worktree_name}" | tr '.-' '__')"
+  if [ -f "$project_app_dir/.env" ]; then
+    cp "$project_app_dir/.env" .env
+    sed -i '' -E "\
+      s|^APP_URL=.*|APP_URL=https://$worktree_host.$TLD|; \
+      s|^DB_DATABASE=.*|DB_DATABASE=$worktree_database|; \
+      s|^CACHE_PREFIX=.*|CACHE_PREFIX=$worktree_database|; \
+      s|^REDIS_PREFIX=.*|REDIS_PREFIX=${worktree_database}:|; \
+      s|^SESSION_COOKIE=.*|SESSION_COOKIE=${worktree_database}_session|; \
+      s|^SESSION_DOMAIN=.*|SESSION_DOMAIN=$worktree_host.$TLD|" .env
+    grep -q '^CACHE_PREFIX='    .env || echo "CACHE_PREFIX=$worktree_database"             >> .env
+    grep -q '^REDIS_PREFIX='    .env || echo "REDIS_PREFIX=${worktree_database}:"          >> .env
+    grep -q '^SESSION_COOKIE='  .env || echo "SESSION_COOKIE=${worktree_database}_session" >> .env
+    grep -q '^SESSION_DOMAIN='  .env || echo "SESSION_DOMAIN=$worktree_host.$TLD"          >> .env
+    ok ".env namespaced"
+  fi
+
+  # 3. deps: instant APFS clone → reconcile against the branch's lockfile
+  [ -d "$project_app_dir/vendor" ] && { cp -c -R "$project_app_dir/vendor" ./vendor 2>/dev/null || true; }
+  [ -f composer.json ] && composer install --no-interaction --quiet
+  if [ -f package.json ]; then
+    [ -d "$project_app_dir/node_modules" ] && { cp -c -R "$project_app_dir/node_modules" ./node_modules 2>/dev/null || true; }
+    npm install --silent
+  fi
+  ok "dependencies ready"
+
+  # 4. isolated database — fresh schema + seed data
+  if [ "$stack" = laravel ]; then
+    mysql -uroot -e "CREATE DATABASE IF NOT EXISTS \`$worktree_database\`"
+    php artisan migrate --force --seed
+    ok "database $worktree_database"
+  fi
+
+  # 5. runtime + serve
+  if [ "$stack" = laravel ]; then
+    php artisan storage:link 2>/dev/null || true
+    herd link "$worktree_host"
+    herd secure "$worktree_host" 2>/dev/null || true
+    ok "$worktree_branch  →  https://$worktree_host.$TLD  (db: $worktree_database)"
+    open "https://$worktree_host.$TLD" 2>/dev/null || true
+  fi
+
+  # hand off inside the worktree: run launch_cmd if given (e.g. claude), else a login shell
+  cd "$app_dir"
+  if [ -n "$launch_cmd" ]; then
+    exec $launch_cmd
+  else
+    exec "$SHELL" -l
+  fi
+}
+
+# ── dispatch ──────────────────────────────────────────────
+case "${1:-}" in
+  -h|--help|help|"") usage 0 ;;
+  new) shift; cmd_new "$@" ;;
+  rm|ls) die "'$1' is not implemented yet" ;;
+  inspect) shift; d="$(cd "$1" && pwd -P)"; a="$(find_app_dir "$d")"; printf '%s\t%s\t%s\n' "$d" "${a#"$d"}" "$(detect_stack "$a")" ;;
+  *)   cmd_new "$@" ;;
+esac
