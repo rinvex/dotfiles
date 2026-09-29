@@ -2,8 +2,9 @@
 # new-worktree — fork a fully isolated, Herd-served worktree off a project.
 #
 #   new-worktree [new] <project_repo> <base_branch> <feature_name> [launch_cmd]
-#   new-worktree rm <worktree_path|name> [--force]
-#   new-worktree ls
+#   new-worktree ls                       (every worktree made by this tool)
+#   new-worktree dev [name]               (node sites: run the dev server on the worktree's port, from inside it or by name)
+#   new-worktree rm <name|path> [--force] (unlink/unproxy, drop the database, remove worktree + merged branch)
 #   new-worktree inspect <path>          (show detected app dir and stack)
 #
 #   launch_cmd (optional): what to exec inside the worktree when done, e.g. "claude".
@@ -222,6 +223,38 @@ clone_storage() {
   else warn "storage/app could not be cloned; worktree starts with empty storage"; fi
 }
 
+# ── registry ──────────────────────────────────────────────
+# One line per worktree, tab-separated:
+#   path  project_repo  branch  stack  host  port  database
+REGISTRY="$WORKTREES_ROOT/.registry.tsv"
+# empty fields are stored as "-" (consecutive tabs would collapse when read back)
+registry_add()    { mkdir -p "$WORKTREES_ROOT"; local f out=""; for f in "$@"; do out="$out${out:+	}${f:--}"; done; printf '%s\n' "$out" >> "$REGISTRY"; }
+nz() { [ "$1" = - ] && printf '' || printf '%s' "$1"; }
+registry_remove() { [ -f "$REGISTRY" ] && { grep -v "^$1	" "$REGISTRY" > "$REGISTRY.tmp" || true; mv "$REGISTRY.tmp" "$REGISTRY"; }; }
+# registry_find NAME_OR_PATH — matches path, worktree folder name, host or branch
+registry_find() {
+  [ -f "$REGISTRY" ] || return 1
+  awk -F'\t' -v q="$1" '$1==q || $1 ~ ("/" q "$") || $5==q || $3==q || $3=="feature/" q {print; exit}' "$REGISTRY" | grep .
+}
+
+# pick_port HOST — stable port derived from the host name, skipping ports in use
+pick_port() {
+  local n port
+  n=$(printf '%s' "$1" | cksum | awk '{print $1}')
+  port=$(( 4400 + n % 500 ))
+  while lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1 || { [ -f "$REGISTRY" ] && cut -f6 "$REGISTRY" | grep -qx "$port"; }; do
+    port=$(( port + 1 )); [ "$port" -gt 4999 ] && port=4400
+  done
+  printf '%s' "$port"
+}
+
+# node_serve APP_DIR HOST PORT — HTTPS proxy in Herd → the worktree's dev server
+node_serve() {
+  local dir="$1" host="$2" port="$3" pm; pm="$(node_pm "$dir")"
+  herd proxy "$host" "http://127.0.0.1:$port" --secure >/dev/null
+  ok "https://$host.$TLD  →  127.0.0.1:$port  (start it with: new-worktree dev)"
+}
+
 # ── new ───────────────────────────────────────────────────
 cmd_new() {
   local args=() a
@@ -246,9 +279,10 @@ cmd_new() {
     || die "base branch not found: $base_branch"
 
   # derived from the blueprint (project side)
-  local project_category project_name
-  project_category="$(basename "$(dirname "$project_repo")")"   # rinvex
-  project_name="$(basename "$project_repo")"                    # awqaf
+  local project_category project_name naming_root="$project_repo"
+  case "$(basename "$project_repo")" in site|app|web|src) naming_root="$(dirname "$project_repo")" ;; esac   # nested repo → parent's name
+  project_category="$(basename "$(dirname "$naming_root")")"   # rinvex
+  project_name="$(basename "$naming_root")"                    # awqaf
 
   # derived for the worktree side
   local worktree_name worktree_branch worktree_path worktree_host
@@ -282,8 +316,8 @@ cmd_new() {
   worktree_database="wt_$(printf '%s' "${project_name}_${worktree_name}" | tr '.-' '__')"
   if [ "$stack" = laravel ]; then
     laravel_env "$project_app_dir" "$app_dir" "$worktree_host" "$worktree_database"
-  elif [ -f "$project_app_dir/.env" ]; then
-    cp "$project_app_dir/.env" .env; ok ".env copied"
+  else
+    local f; for f in .env .dev.vars; do [ -f "$project_app_dir/$f" ] && { cp "$project_app_dir/$f" "$f"; ok "$f copied"; }; done
   fi
 
   # 3. deps: instant APFS clone → reconcile against the branch's lockfile
@@ -298,14 +332,27 @@ cmd_new() {
   build_assets "$app_dir" "$stack"
 
   # 6. runtime + serve
-  if [ "$stack" = laravel ]; then
-    clone_storage "$project_app_dir" "$app_dir"
-    php artisan storage:link 2>/dev/null || true
-    herd link "$worktree_host"
-    herd secure "$worktree_host" 2>/dev/null || true
-    ok "$worktree_branch  →  https://$worktree_host.$TLD  (db: $worktree_database)"
-    [ "$OPT_OPEN" = 1 ] && { open "https://$worktree_host.$TLD" 2>/dev/null || true; }
-  fi
+  local port=""
+  case "$stack" in
+    laravel)
+      clone_storage "$project_app_dir" "$app_dir"
+      php artisan storage:link 2>/dev/null || true
+      herd link "$worktree_host" >/dev/null
+      herd secure "$worktree_host" >/dev/null 2>&1 || true
+      ok "$worktree_branch  →  https://$worktree_host.$TLD  (db: $worktree_database)"
+      [ "$OPT_OPEN" = 1 ] && { open "https://$worktree_host.$TLD" 2>/dev/null || true; }
+      ;;
+    node)
+      port="$(pick_port "$worktree_host")"
+      node_serve "$app_dir" "$worktree_host" "$port"
+      worktree_database=""
+      ;;
+    *)
+      worktree_database=""
+      ok "$worktree_branch ready (nothing to serve)"
+      ;;
+  esac
+  registry_add "$worktree_path" "$project_repo" "$worktree_branch" "$stack" "$worktree_host" "$port" "$worktree_database"
 
   # hand off inside the worktree: run launch_cmd if given (e.g. claude), else a login shell
   cd "$app_dir"
@@ -316,12 +363,38 @@ cmd_new() {
   fi
 }
 
+# ── dev ───────────────────────────────────────────────────
+# Resolve the registry line for a name, a path, or the current directory.
+resolve_entry() {
+  local q="${1:-}" entry=""
+  if [ -n "$q" ]; then entry="$(registry_find "$q" || true)"; [ -z "$entry" ] && [ -d "$q" ] && entry="$(registry_find "$(cd "$q" && pwd -P)" || true)"
+  else
+    local d; d="$(pwd -P)"
+    while [ "$d" != / ]; do entry="$(registry_find "$d" || true)"; [ -n "$entry" ] && break; d="$(dirname "$d")"; done
+  fi
+  [ -n "$entry" ] || return 1
+  printf '%s' "$entry"
+}
+
+cmd_dev() {
+  local entry; entry="$(resolve_entry "${1:-}")" || die "not a registered worktree: ${1:-$(pwd)} (see: new-worktree ls)"
+  local path stack host port; IFS=$'\t' read -r path _ _ stack host port _ <<< "$entry"; port="$(nz "$port")"
+  [ "$stack" = node ] || die "'dev' is for node sites; this is a $stack worktree served by Herd at https://$host.$TLD"
+  local dir; dir="$(find_app_dir "$path")"; local pm; pm="$(node_pm "$dir")"
+  say "https://$host.$TLD  →  127.0.0.1:$port"
+  cd "$dir"
+  # Vite refuses unknown Host headers; this env var whitelists the proxy host without touching config
+  export __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS="$host.$TLD"
+  exec "$pm" run dev -- --port "$port" --host 127.0.0.1
+}
+
 # ── dispatch ──────────────────────────────────────────────
 # `NEW_WORKTREE_LIB=1 source new-worktree` loads the functions without running anything (tests)
 [ "${NEW_WORKTREE_LIB:-}" = 1 ] && return 0 2>/dev/null
 case "${1:-}" in
   -h|--help|help|"") usage 0 ;;
   new) shift; cmd_new "$@" ;;
+  dev) shift; cmd_dev "$@" ;;
   rm|ls) die "'$1' is not implemented yet" ;;
   inspect) shift; d="$(cd "$1" && pwd -P)"; a="$(find_app_dir "$d")"; printf '%s\t%s\t%s\n' "$d" "${a#"$d"}" "$(detect_stack "$a")" ;;
   *)   cmd_new "$@" ;;
