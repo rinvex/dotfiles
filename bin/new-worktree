@@ -268,6 +268,8 @@ cmd_new() {
   [ $# -ge 3 ] || usage
   local project_repo base_branch new_feature launch_cmd
   project_repo="$(cd "$1" 2>/dev/null && pwd -P)" || die "project path not found: $1"
+  # any path inside a repo means that repo
+  project_repo="$(git -C "$project_repo" rev-parse --show-toplevel 2>/dev/null)" || die "not a git repository: $1"
   base_branch="$2"
   new_feature="$3"
   launch_cmd="${4:-}"
@@ -279,10 +281,9 @@ cmd_new() {
     || die "base branch not found: $base_branch"
 
   # derived from the blueprint (project side)
-  local project_category project_name naming_root="$project_repo"
-  case "$(basename "$project_repo")" in site|app|web|src) naming_root="$(dirname "$project_repo")" ;; esac   # nested repo → parent's name
-  project_category="$(basename "$(dirname "$naming_root")")"   # rinvex
-  project_name="$(basename "$naming_root")"                    # awqaf
+  local project_category project_name
+  project_category="$(basename "$(dirname "$project_repo")")"   # rinvex
+  project_name="$(basename "$project_repo")"                    # awqaf
 
   # derived for the worktree side
   local worktree_name worktree_branch worktree_path worktree_host

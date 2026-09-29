@@ -35,7 +35,7 @@ What it sets up, per stack:
 | files | `storage/app` copy-on-write clone, `storage:link`, Vite build | — |
 | teardown | `rm`: unlink/unsecure, drop database, remove worktree, delete branch if merged | `rm`: unproxy, remove, delete branch |
 
-Repos whose app lives in `site/` (or `app/`, `web/`) are detected from tracked files, and a
-nested `…/site` repo is named after its parent folder. `~/Worktrees/.registry.tsv` records
-every worktree for `ls`, `dev` and `rm`.
+Monorepos whose app lives in a tracked `site/` (or `app/`, `web/`) subfolder are detected
+automatically, and any path inside a repo resolves to that repo. `~/Worktrees/.registry.tsv`
+records every worktree for `ls`, `dev` and `rm`.
 
