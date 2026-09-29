@@ -388,14 +388,78 @@ cmd_dev() {
   exec "$pm" run dev -- --port "$port" --host 127.0.0.1
 }
 
+# ── ls ────────────────────────────────────────────────────
+cmd_ls() {
+  [ -s "$REGISTRY" ] || { echo "no worktrees (root: $WORKTREES_ROOT)"; return 0; }
+  { printf 'NAME\tBRANCH\tSTACK\tURL\tPATH\n'
+    while IFS=$'\t' read -r path _ branch stack host port db; do
+      port="$(nz "$port")"; local st=""; [ -d "$path" ] || st=" (missing!)"
+      printf '%s\t%s\t%s\t%s\t%s%s\n' "$(basename "$path")" "$branch" "$stack" "https://$host.$TLD${port:+ →:$port}" "$path" "$st"
+    done < "$REGISTRY"; } | column -t -s $'\t'
+}
+
+# ── rm ────────────────────────────────────────────────────
+cmd_rm() {
+  local force=0 args=() a
+  for a in "$@"; do case "$a" in --force|-f) force=1 ;; --*) die "unknown option: $a" ;; *) args+=("$a") ;; esac; done
+  [ ${#args[@]} -ge 1 ] || usage
+  local entry; entry="$(resolve_entry "${args[0]}")" || die "not a registered worktree: ${args[0]} (see: new-worktree ls)"
+  local path repo branch stack host port db; IFS=$'\t' read -r path repo branch stack host port db <<< "$entry"
+  port="$(nz "$port")"; db="$(nz "$db")"
+  say "removing $path  ($branch)"
+
+  # refuse to throw away work unless forced
+  if [ -d "$path" ] && [ "$force" = 0 ] && [ -n "$(git -C "$path" status --porcelain 2>/dev/null)" ]; then
+    git -C "$path" status --short | head -20
+    die "worktree has uncommitted changes; commit them or re-run with --force"
+  fi
+
+  # 1. stop serving
+  case "$stack" in
+    laravel) herd unsecure "$host" >/dev/null 2>&1 || true; herd unlink "$host" >/dev/null 2>&1 || true; ok "herd link removed" ;;
+    node)    herd unproxy "$host" >/dev/null 2>&1 || true; ok "herd proxy removed" ;;
+  esac
+
+  # 2. drop the database (server-side ones; sqlite files go with the folder)
+  if [ -n "$db" ] && [ -f "$path/.env" ] || [ -n "$db" ] && [ -f "$(find_app_dir "$path" 2>/dev/null)/.env" ]; then
+    local env; env="$(find_app_dir "$path")/.env"
+    local driver h P u pw; driver="$(env_get "$env" DB_CONNECTION)"
+    h="$(env_get "$env" DB_HOST)"; P="$(env_get "$env" DB_PORT)"; u="$(env_get "$env" DB_USERNAME)"; pw="$(env_get "$env" DB_PASSWORD)"
+    case "$driver" in
+      mysql|mariadb) local margs=(-h"${h:-127.0.0.1}" -P"${P:-3306}" -u"${u:-root}"); [ -n "$pw" ] && margs+=(-p"$pw")
+                     mysql "${margs[@]}" -e "DROP DATABASE IF EXISTS \`$db\`" && ok "database $db dropped" ;;
+      pgsql)         PGPASSWORD="$pw" psql -h"${h:-127.0.0.1}" -p"${P:-5432}" -U"${u:-postgres}" -d postgres -c "DROP DATABASE IF EXISTS \"$db\"" >/dev/null && ok "database $db dropped" ;;
+    esac
+  fi
+
+  # 3. the worktree itself
+  if [ -d "$path" ]; then
+    git -C "$repo" worktree remove ${force:+--force} "$path" 2>/dev/null || git -C "$repo" worktree remove --force "$path"
+  fi
+  git -C "$repo" worktree prune
+  ok "worktree removed"
+
+  # 4. the branch: only if fully merged somewhere; otherwise keep it and say so
+  if git -C "$repo" rev-parse --verify --quiet "refs/heads/$branch" >/dev/null; then
+    if git -C "$repo" branch -d "$branch" >/dev/null 2>&1; then ok "branch $branch deleted (was merged)"
+    elif [ "$force" = 1 ]; then git -C "$repo" branch -D "$branch" >/dev/null && warn "branch $branch force-deleted"
+    else warn "branch $branch kept: it has unmerged commits (delete with: git -C $repo branch -D $branch)"; fi
+  fi
+
+  registry_remove "$path"
+  # tidy empty parents
+  rmdir "$(dirname "$path")" "$(dirname "$(dirname "$path")")" 2>/dev/null || true
+}
+
 # ── dispatch ──────────────────────────────────────────────
 # `NEW_WORKTREE_LIB=1 source new-worktree` loads the functions without running anything (tests)
 [ "${NEW_WORKTREE_LIB:-}" = 1 ] && return 0 2>/dev/null
 case "${1:-}" in
   -h|--help|help|"") usage 0 ;;
   new) shift; cmd_new "$@" ;;
+  ls)  cmd_ls ;;
   dev) shift; cmd_dev "$@" ;;
-  rm|ls) die "'$1' is not implemented yet" ;;
+  rm)  shift; cmd_rm "$@" ;;
   inspect) shift; d="$(cd "$1" && pwd -P)"; a="$(find_app_dir "$d")"; printf '%s\t%s\t%s\n' "$d" "${a#"$d"}" "$(detect_stack "$a")" ;;
   *)   cmd_new "$@" ;;
 esac
